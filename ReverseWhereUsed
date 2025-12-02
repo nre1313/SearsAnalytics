@@ -1,0 +1,296 @@
+# ============================================================
+#  BOM Builder (Forward + Reverse Where-Used) — Chunked Reverse
+# ============================================================
+
+from pyspark.sql import SparkSession, Window, functions as F, types as T
+import pandas as pd
+from collections import defaultdict, OrderedDict, deque
+
+# ----------------------------------------------------------------
+# Spark session / conf
+# ----------------------------------------------------------------
+spark = SparkSession.builder.getOrCreate()
+spark.conf.set("spark.sql.shuffle.partitions", 200)   # tune as needed
+
+
+# ============================================================
+#  FORWARD BOM EXPLOSION 
+# ============================================================
+
+def build_boms():
+    query = """
+        SELECT FINPartNum, PartPath, QtyPath
+        FROM py_fullwhereused
+        WHERE PartPath IS NOT NULL
+    """
+    df = spark.sql(query)
+
+    df = df.repartition("FINPartNum").persist()
+
+    # ----------------------
+    # pandas UDF per part
+    # ----------------------
+    def build_bom(pdf: pd.DataFrame) -> pd.DataFrame:
+        if pdf.empty:
+            return pd.DataFrame(columns=[
+                "FINPartNum", "ParentPart", "Part", "BOMLevel", "Qty", "OrderIndex"
+            ])
+
+        fin = pdf["FINPartNum"].iloc[0]
+
+        # adjacency
+        tree = defaultdict(OrderedDict)
+        qty_lookup = {}
+        root_qty = {}
+        order_counter = 0
+        seen_roots, seen_root_set = [], set()
+        all_parents, all_children = set(), set()
+
+        def sfloat(x):
+            try:
+                return float(x)
+            except:
+                return 1.0
+
+        # build adjacency
+        for _, row in pdf.iterrows():
+            parts = [p.strip() for p in (row.PartPath or "").split("|") if p.strip()]
+            qtys = [sfloat(q) for q in (row.QtyPath or "").split("|")] if row.QtyPath else []
+            if len(qtys) < len(parts):
+                qtys += [1.0] * (len(parts) - len(qtys))
+
+            if parts:
+                top = parts[0]
+                if top not in seen_root_set:
+                    seen_roots.append(top)
+                    seen_root_set.add(top)
+                root_qty.setdefault(top, qtys[0])
+
+            for i in range(1, len(parts)):
+                parent, child = parts[i - 1], parts[i]
+                all_parents.add(parent)
+                all_children.add(child)
+                if child not in tree[parent]:
+                    tree[parent][child] = order_counter
+                    order_counter += 1
+                qty_lookup[(parent, child)] = qtys[i]
+
+        roots = [p for p in seen_roots if p in all_parents and p not in all_children]
+        if not roots:
+            roots = seen_roots.copy()
+
+        # -----------
+        # DFS
+        # -----------
+        rows = []
+        order_counter = 0
+
+        def traverse(node, level, parent):
+            nonlocal order_counter
+            qty_val = root_qty.get(node, 1.0) if level == 0 else qty_lookup.get((parent, node), 1.0)
+            rows.append((fin, parent, node, level, float(qty_val), order_counter))
+            order_counter += 1
+
+            children = sorted(tree.get(node, {}).items(), key=lambda x: x[1])
+            leafs = [c for c, _ in children if c not in tree]
+            parents = [c for c, _ in children if c in tree]
+
+            for c in leafs:
+                traverse(c, level + 1, node)
+            for c in parents:
+                traverse(c, level + 1, node)
+
+        for r in roots:
+            traverse(r, 0, None)
+
+        return pd.DataFrame(rows, columns=[
+            "FINPartNum", "ParentPart", "Part", "BOMLevel", "Qty", "OrderIndex"
+        ])
+
+    schema = T.StructType([
+        T.StructField("FINPartNum", T.StringType()),
+        T.StructField("ParentPart", T.StringType()),
+        T.StructField("Part", T.StringType()),
+        T.StructField("BOMLevel", T.IntegerType()),
+        T.StructField("Qty", T.DoubleType()),
+        T.StructField("OrderIndex", T.LongType()),
+    ])
+
+    forward_bom = (
+        df.groupBy("FINPartNum")
+          .applyInPandas(build_bom, schema=schema)
+          .orderBy("FINPartNum", "OrderIndex")
+    )
+
+    # add DisplayOrder
+    window = Window.partitionBy("FINPartNum").orderBy("OrderIndex")
+    forward_bom = forward_bom.withColumn("DisplayOrder", F.row_number().over(window))
+
+    # reorder
+    forward_bom = forward_bom.select(
+        "DisplayOrder", "FINPartNum", "ParentPart", "Part", "BOMLevel", "Qty"
+    ).persist()
+
+    return forward_bom
+
+
+# ============================================================
+#  REVERSE WHERE-USED — PANDAS GRAPH, CHUNKED BY FINPartNum
+#  - Qty only at deepest parent
+# ============================================================
+
+def _reverse_for_single_fin(ppdf: pd.DataFrame, fin: str) -> pd.DataFrame:
+    """
+    Internal helper: build reverse where-used for a single FINPartNum,
+    using in-memory pandas graph BFS.
+    """
+    if ppdf.empty:
+        return pd.DataFrame(columns=["FINPartNum", "BOMLevel", "ParentPart", "Part", "Qty"])
+
+    # 1) build parent->children and child->parents maps
+    children_map = defaultdict(list)
+    for _, r in ppdf.iterrows():
+        parent = r["ParentPart"]
+        child = r["Part"]
+        qty = r["Qty"]
+        if pd.notnull(parent):
+            children_map[parent].append((child, qty))
+
+    parents_map = defaultdict(list)
+    for parent, children in children_map.items():
+        for child, qty in children:
+            parents_map[child].append((parent, qty))
+
+    # 2) BFS upward for each child in this FIN
+    target_children = ppdf["Part"].dropna().unique().tolist()
+
+    rows = []
+
+    for child in target_children:
+        if child not in parents_map:
+            continue
+
+        queue = deque()
+        visited = set()
+
+        # seed: direct parents
+        for parent, qty in parents_map[child]:
+            queue.append((parent, 0, qty, True))  # (parent_node, plevel_from_child, qty, is_direct)
+            visited.add(parent)
+
+        while queue:
+            parent, plevel, qty, is_direct = queue.popleft()
+
+            # record row with provisional BOMLevel = plevel (0 is closest to child)
+            rows.append((
+                fin,
+                parent,
+                child,
+                plevel,
+                qty if is_direct else None  # qty only at deepest parent (closest to child)
+            ))
+
+            # go up to grandparents
+            if parent in parents_map:
+                for gparent, _ in parents_map[parent]:
+                    if gparent not in visited:
+                        visited.add(gparent)
+                        queue.append((gparent, plevel + 1, None, False))
+
+    if not rows:
+        return pd.DataFrame(columns=["FINPartNum", "BOMLevel", "ParentPart", "Part", "Qty"])
+
+    rev_pdf = pd.DataFrame(rows, columns=["FINPartNum", "ParentPart", "Part", "BOMLevel", "Qty"])
+
+    # 3) Re-index BOMLevel so 0 = top parent, increasing toward child
+    #    For each (FINPartNum, Part), max plevel is the top parent.
+    rev_pdf["BOMLevel"] = rev_pdf["BOMLevel"].astype(int)
+    max_level = rev_pdf.groupby(["FINPartNum", "Part"])["BOMLevel"].transform("max")
+    rev_pdf["BOMLevel"] = max_level - rev_pdf["BOMLevel"]
+
+    # final column order
+    rev_pdf = rev_pdf[["FINPartNum", "BOMLevel", "ParentPart", "Part", "Qty"]]
+
+    return rev_pdf
+
+
+def build_reverse_whereused_pandas(forward_bom, filter_fin=None):
+    """
+    Chunked reverse where-used:
+      - If filter_fin is provided: only that FINPartNum
+      - Otherwise: processes all FINPartNum values in chunks
+    """
+
+    # Decide which FINs to process
+    if filter_fin:
+        fin_list = [filter_fin]
+    else:
+        fin_list = [
+            r["FINPartNum"]
+            for r in forward_bom.select("FINPartNum").distinct().collect()
+        ]
+
+    spark_dfs = []
+
+    for fin in fin_list:
+        print(f"[Reverse Pandas] Processing FINPartNum = {fin} ...")
+
+        # Extract subset for this FINPartNum only
+        ppdf = (
+            forward_bom
+            .filter(F.col("FINPartNum") == fin)
+            .select("FINPartNum", "ParentPart", "Part", "BOMLevel", "Qty")
+            .toPandas()
+        )
+
+        if ppdf.empty:
+            print(f"  - No rows for {fin}, skipping.")
+            continue
+
+        # Run in-memory reverse for this one FIN
+        rev_pdf = _reverse_for_single_fin(ppdf, fin)
+
+        if rev_pdf.empty:
+            print(f"  - Reverse result empty for {fin}, skipping.")
+            continue
+
+        sdf = spark.createDataFrame(rev_pdf)
+        spark_dfs.append(sdf)
+        print(f"  - Completed {fin}: {sdf.count()} rows.")
+
+    if not spark_dfs:
+        print("No reverse where-used rows produced.")
+        # empty schema matching expected columns
+        empty_schema = T.StructType([
+            T.StructField("FINPartNum", T.StringType()),
+            T.StructField("BOMLevel", T.IntegerType()),
+            T.StructField("ParentPart", T.StringType()),
+            T.StructField("Part", T.StringType()),
+            T.StructField("Qty", T.DoubleType()),
+        ])
+        return spark.createDataFrame([], schema=empty_schema)
+
+    # Union all per-FIN DataFrames
+    reverse_bom = spark_dfs[0]
+    for sdf in spark_dfs[1:]:
+        reverse_bom = reverse_bom.unionByName(sdf)
+
+    return reverse_bom
+
+
+# ============================================================
+# EXAMPLE USAGE
+# ============================================================
+
+# 1) Build forward BOM (once)
+forward_bom = build_boms()
+
+# 2a) Filtered test (single FINPartNum)
+# reverse_bom = build_reverse_whereused_pandas(forward_bom, filter_fin="SA49299.904")
+
+# 2b) Full dataset (all FINPartNum, chunked safely)
+reverse_bom = build_reverse_whereused_pandas(forward_bom)
+
+# Optional: register temp views
+#forward_bom.createOrReplaceTempView("forward_bom")
+#reverse_bom.createOrReplaceTempView("reverse_bom")
